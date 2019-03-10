@@ -3,9 +3,16 @@ package filecache
 import (
 	"encoding/binary"
 	"errors"
-	"github.com/boltdb/bolt"
 	"sync"
 	"time"
+
+	"github.com/boltdb/bolt"
+	"github.com/mattn/go-nulltype"
+)
+
+var (
+	NullString = nulltype.NullString{}
+	KeyExpired = errors.New("key expired")
 )
 
 type KV struct {
@@ -30,23 +37,14 @@ type CacheImpl struct {
 	conn     *bolt.DB
 }
 
-func (r *CacheImpl) Get(key string) (string, error) {
-	result, err := r.get(key)
+func (r *CacheImpl) Get(key string) (nulltype.NullString, error) {
+	ttl, result, err := r.getWithExpire(key)
 	if err != nil {
-		return "", nil
+		return NullString, err
+	} else if ttl < -1 {
+		return NullString, nil
 	}
-	expiredAt, err := binaryInt(result[:8])
-	if err != nil {
-		return "", err
-	}
-	ttl := expiredAt - int(time.Now().UnixNano()/int64(1000000))
-	if ttl < 0 {
-		// 过期了
-		// TODO: 删除
-		return "", err
-	}
-
-	return string(result[8:]), nil
+	return nulltype.NullStringOf(string(result)), nil
 }
 
 func (r *CacheImpl) Set(key, val string, ttl time.Duration) error {
@@ -66,19 +64,72 @@ func (r *CacheImpl) Set(key, val string, ttl time.Duration) error {
 }
 
 func (r *CacheImpl) TTL(key string) (time.Duration, error) {
-	panic("implement me")
+	ttl, _, err := r.getWithExpire(key)
+	if err != nil {
+		return -1, err
+	} else if ttl < -1 {
+		return -1, nil
+	}
+	return time.Duration(ttl) * time.Millisecond, nil
 }
 
 func (r *CacheImpl) Expire(key string, ttl time.Duration) error {
-	panic("implement me")
+	_, result, err := r.getWithExpire(key)
+	if err != nil {
+		return err
+	} else if ttl < -1 {
+		return KeyExpired
+	}
+	return r.Set(key, string(result), ttl)
 }
 
 func (r *CacheImpl) Del(key string) error {
-	panic("implement me")
+	if err := r.newConn(); err != nil {
+		return err
+	}
+
+	return r.conn.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(r.bucket)
+		if err != nil {
+			return err
+		}
+		return b.Delete([]byte(key))
+	})
 }
 
 func (r *CacheImpl) Range() ([]*KV, error) {
-	panic("implement me")
+	if err := r.newConn(); err != nil {
+		return nil, err
+	}
+
+	var kvs []*KV
+	if err := r.conn.View(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(r.bucket)
+		if err != nil {
+			return err
+		}
+		return b.ForEach(func(k, v []byte) error {
+			expiredAt, err := binaryInt(v[:8])
+			if err != nil {
+				return err
+			}
+			ttl := expiredAt - int(time.Now().UnixNano()/int64(1000000))
+			if ttl < 0 {
+				// TODO: 删除
+				return nil
+			}
+
+			kvs = append(kvs, &KV{
+				Key: string(k),
+				Val: string(v[8:]),
+				TTL: time.Duration(ttl) * time.Millisecond,
+			})
+			return nil
+		})
+	}); err != nil {
+		return nil, err
+	}
+	return kvs, nil
 }
 
 func (r *CacheImpl) newConn() error {
@@ -99,7 +150,7 @@ func New(filepath string) *CacheImpl {
 	}
 }
 
-func (r *CacheImpl) get(key string) ([]byte, error) {
+func (r *CacheImpl) getOriginData(key string) ([]byte, error) {
 	if err := r.newConn(); err != nil {
 		return nil, err
 	}
@@ -118,6 +169,25 @@ func (r *CacheImpl) get(key string) ([]byte, error) {
 	}
 
 	return result, nil
+}
+
+func (r *CacheImpl) getWithExpire(key string) (int, []byte, error) {
+	result, err := r.getOriginData(key)
+	if err != nil {
+		return -1, nil, nil
+	}
+	expiredAt, err := binaryInt(result[:8])
+	if err != nil {
+		return -1, nil, err
+	}
+	ttl := expiredAt - int(time.Now().UnixNano()/int64(1000000))
+	if ttl < 0 {
+		// 过期了
+		// TODO: 删除
+		return -1, nil, err
+	}
+
+	return ttl, result[8:], nil
 }
 
 func toMillisecond(ttl time.Duration) int64 {
