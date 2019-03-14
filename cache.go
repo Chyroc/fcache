@@ -3,6 +3,8 @@ package fcache
 import (
 	"encoding/binary"
 	"errors"
+	"os/user"
+	"strings"
 	"sync"
 	"time"
 
@@ -149,6 +151,13 @@ func (r *CacheImpl) newConn() error {
 }
 
 func New(filepath string) *CacheImpl {
+	if strings.HasPrefix(filepath, "~") {
+		u, err := user.Current()
+		if err != nil {
+			panic(err)
+		}
+		filepath = u.HomeDir + filepath[1:]
+	}
 	return &CacheImpl{
 		filepath: filepath,
 		bucket:   []byte("f-cache"),
