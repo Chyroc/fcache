@@ -24,7 +24,9 @@ type KV struct {
 }
 
 type Cache interface {
-	Get(key string) (string, error)
+	GetBytes(key string) ([]byte, error)
+	Get(key string) (nulltype.NullString, error)
+	SetBytes(key string, val []byte, ttl time.Duration) error
 	Set(key, val string, ttl time.Duration) error
 	TTL(key string) (time.Duration, error)
 	Expire(key string, ttl time.Duration) error
@@ -32,11 +34,35 @@ type Cache interface {
 	Range() ([]*KV, error)
 }
 
+func New(filepath string) Cache {
+	if strings.HasPrefix(filepath, "~") {
+		u, err := user.Current()
+		if err != nil {
+			panic(err)
+		}
+		filepath = u.HomeDir + filepath[1:]
+	}
+	return &CacheImpl{
+		filepath: filepath,
+		bucket:   []byte("f-cache"),
+	}
+}
+
 type CacheImpl struct {
 	filepath string
 	bucket   []byte
 	bOnce    sync.Once
 	conn     *bolt.DB
+}
+
+func (r *CacheImpl) GetBytes(key string) ([]byte, error) {
+	ttl, result, err := r.getWithExpire(key)
+	if err != nil {
+		return nil, err
+	} else if ttl < 0 {
+		return nil, nil
+	}
+	return result, nil
 }
 
 func (r *CacheImpl) Get(key string) (nulltype.NullString, error) {
@@ -48,6 +74,26 @@ func (r *CacheImpl) Get(key string) (nulltype.NullString, error) {
 		return nulltype.NullString{}, nil
 	}
 	return nulltype.NullStringOf(string(result)), nil
+}
+
+func (r *CacheImpl) SetBytes(key string, val []byte, ttl time.Duration) error {
+	if err := r.newConn(); err != nil {
+		return err
+	}
+
+	return r.conn.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(r.bucket)
+		if err != nil {
+			return err
+		}
+
+		buf := make([]byte, 8+len(val))
+		binary.PutVarint(buf[:8], toMillisecond(ttl))
+		copy(buf[8:], val)
+
+		//fmt.Println(key, buf[:8], buf[8:])
+		return b.Put([]byte(key), buf)
+	})
 }
 
 func (r *CacheImpl) Set(key, val string, ttl time.Duration) error {
@@ -148,20 +194,6 @@ func (r *CacheImpl) newConn() error {
 		r.conn = db
 	}
 	return nil
-}
-
-func New(filepath string) *CacheImpl {
-	if strings.HasPrefix(filepath, "~") {
-		u, err := user.Current()
-		if err != nil {
-			panic(err)
-		}
-		filepath = u.HomeDir + filepath[1:]
-	}
-	return &CacheImpl{
-		filepath: filepath,
-		bucket:   []byte("f-cache"),
-	}
 }
 
 func (r *CacheImpl) getOriginData(key string) ([]byte, error) {
