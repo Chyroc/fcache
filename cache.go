@@ -1,4 +1,4 @@
-package filecache
+package fcache
 
 import (
 	"encoding/binary"
@@ -39,10 +39,11 @@ type CacheImpl struct {
 
 func (r *CacheImpl) Get(key string) (nulltype.NullString, error) {
 	ttl, result, err := r.getWithExpire(key)
+	//fmt.Println(ttl, result, err)
 	if err != nil {
 		return NullString, err
-	} else if ttl < -1 {
-		return NullString, nil
+	} else if ttl < 0 {
+		return nulltype.NullString{}, nil
 	}
 	return nulltype.NullStringOf(string(result)), nil
 }
@@ -53,12 +54,16 @@ func (r *CacheImpl) Set(key, val string, ttl time.Duration) error {
 	}
 
 	return r.conn.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(r.bucket)
+		b, err := tx.CreateBucketIfNotExists(r.bucket)
+		if err != nil {
+			return err
+		}
 
 		buf := make([]byte, 8+len(val))
 		binary.PutVarint(buf[:8], toMillisecond(ttl))
 		copy(buf[8:], val)
 
+		//fmt.Println(key, buf[:8], buf[8:])
 		return b.Put([]byte(key), buf)
 	})
 }
@@ -104,9 +109,9 @@ func (r *CacheImpl) Range() ([]*KV, error) {
 
 	var kvs []*KV
 	if err := r.conn.View(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists(r.bucket)
-		if err != nil {
-			return err
+		b := tx.Bucket(r.bucket)
+		if b == nil {
+			return nil
 		}
 		return b.ForEach(func(k, v []byte) error {
 			expiredAt, err := binaryInt(v[:8])
@@ -157,9 +162,9 @@ func (r *CacheImpl) getOriginData(key string) ([]byte, error) {
 
 	var result []byte
 	if err := r.conn.View(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists(r.bucket)
-		if err != nil {
-			return err
+		b := tx.Bucket(r.bucket)
+		if b == nil {
+			return nil
 		}
 
 		result = b.Get([]byte(key))
@@ -173,7 +178,10 @@ func (r *CacheImpl) getOriginData(key string) ([]byte, error) {
 
 func (r *CacheImpl) getWithExpire(key string) (int, []byte, error) {
 	result, err := r.getOriginData(key)
+	//fmt.Println(1, result, err)
 	if err != nil {
+		return -1, nil, nil
+	} else if result == nil {
 		return -1, nil, nil
 	}
 	expiredAt, err := binaryInt(result[:8])
